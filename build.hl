@@ -1,0 +1,5 @@
+// golang
+
+> cd source-code
+> go get ghdir
+> go build
