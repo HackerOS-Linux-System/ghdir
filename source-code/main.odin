@@ -15,11 +15,11 @@ import "base:runtime"
 import "vendor:curl"
 import "core:c/libc"
 import "core:bytes"
-title_style :: "\x1b[1;38;5;86m" // Bold, cyan-like
-success_style :: "\x1b[1;38;5;82m" // Bold, green
-error_style :: "\x1b[1;31m" // Bold, red
-warning_style :: "\x1b[1;38;5;208m" // Bold, orange
-info_style :: "\x1b[1;38;5;39m" // Bold, blue
+title_style :: "\x1b[1;38;5;86m"
+success_style :: "\x1b[1;38;5;82m"
+error_style :: "\x1b[1;31m"
+warning_style :: "\x1b[1;38;5;208m"
+info_style :: "\x1b[1;38;5;39m"
 reset :: "\x1b[0m"
 main :: proc() {
     curl.global_init(curl.GLOBAL_ALL)
@@ -124,11 +124,12 @@ handle_file :: proc(args: []string) {
     fmt.printf("%sgetit file • Pobieranie pliku%s\n", title_style, reset)
     fmt.printf(" URL: %s\n", url)
     fmt.printf(" Zapisywanie jako: %s\n\n", filename)
-    // HEAD to get content_length
     head_handle := curl.easy_init()
     defer curl.easy_cleanup(head_handle)
     curl.easy_setopt(head_handle, .URL, url)
     curl.easy_setopt(head_handle, .NOBODY, i64(1))
+    curl.easy_setopt(head_handle, .FOLLOWLOCATION, i64(1))
+    curl.easy_setopt(head_handle, .MAXREDIRS, i64(10))
     res := curl.easy_perform(head_handle)
     if res != .E_OK {
         fmt.printf("%sBłąd: Nie można pobrać pliku (%s)%s\n", error_style, curl.easy_strerror(res), reset)
@@ -142,7 +143,6 @@ handle_file :: proc(args: []string) {
     }
     content_length: i64 = -1
     curl.easy_getinfo(head_handle, .CONTENT_LENGTH_DOWNLOAD_T, &content_length)
-    // Open file
     c_filename := strings.clone_to_cstring(filename, context.temp_allocator)
     f := libc.fopen(c_filename, "wb")
     if f == nil {
@@ -150,10 +150,11 @@ handle_file :: proc(args: []string) {
         os.exit(1)
     }
     defer libc.fclose(f)
-    // GET
     get_handle := curl.easy_init()
     defer curl.easy_cleanup(get_handle)
     curl.easy_setopt(get_handle, .URL, url)
+    curl.easy_setopt(get_handle, .FOLLOWLOCATION, i64(1))
+    curl.easy_setopt(get_handle, .MAXREDIRS, i64(10))
     curl.easy_setopt(get_handle, .WRITEDATA, f)
     bar := new_progress_bar(content_length, "Pobieranie")
     curl.easy_setopt(get_handle, .XFERINFODATA, &bar)
@@ -198,9 +199,9 @@ handle_repo :: proc(args: []string) {
         fmt.printf("%sRepozytorium sklonowane pomyślnie%s\n", success_style, reset)
     } else if push {
         fmt.printf("%sPushowanie zmian...%s\n", info_style, reset)
-        err := run_command("git", "remote", "add", "origin", link) // Zakładamy dodanie remote jeśli potrzeba
+        err := run_command("git", "remote", "add", "origin", link)
         if err != "" { /* ignore if exists */ }
-        err = run_command("git", "push", "origin", "main") // Zakładamy branch main
+        err = run_command("git", "push", "origin", "main")
         if err != "" {
             fmt.printf("%sBłąd podczas push: %s%s\n", error_style, err, reset)
             os.exit(1)
@@ -244,6 +245,9 @@ handle_dir :: proc(args: []string) {
     head_handle := curl.easy_init()
     defer curl.easy_cleanup(head_handle)
     curl.easy_setopt(head_handle, .URL, tar_url)
+    curl.easy_setopt(head_handle, .NOBODY, i64(1))
+    curl.easy_setopt(head_handle, .FOLLOWLOCATION, i64(1))
+    curl.easy_setopt(head_handle, .MAXREDIRS, i64(10))
     slist: ^curl.slist
     if etag != "" {
         if_none_match := fmt.tprintf("If-None-Match: %s", etag)
@@ -252,7 +256,6 @@ handle_dir :: proc(args: []string) {
         curl.easy_setopt(head_handle, .HTTPHEADER, slist)
     }
     defer if slist != nil { curl.slist_free_all(slist) }
-    curl.easy_setopt(head_handle, .NOBODY, i64(1))
     hd: map[string]string
     defer delete(hd)
     curl.easy_setopt(head_handle, .HEADERDATA, &hd)
@@ -274,8 +277,8 @@ handle_dir :: proc(args: []string) {
     }
     content_length: i64 = -1
     curl.easy_getinfo(head_handle, .CONTENT_LENGTH_DOWNLOAD_T, &content_length)
-    use_sparse := folder != "" && content_length > 500*1024*1024 // 500 MB
-    large_threshold :: 2 * 1024 * 1024 * 1024 // 2 GB
+    use_sparse := folder != "" && content_length > 500*1024*1024
+    large_threshold :: 2 * 1024 * 1024 * 1024
     if content_length > large_threshold {
         size_mb := content_length / (1024 * 1024)
         fmt.printf("%sOstrzeżenie: Archiwum jest duże (%d MB). To może zająć dużo czasu.%s\n", warning_style, size_mb, reset)
@@ -303,6 +306,8 @@ handle_dir :: proc(args: []string) {
         get_handle := curl.easy_init()
         defer curl.easy_cleanup(get_handle)
         curl.easy_setopt(get_handle, .URL, tar_url)
+        curl.easy_setopt(get_handle, .FOLLOWLOCATION, i64(1))
+        curl.easy_setopt(get_handle, .MAXREDIRS, i64(10))
         slist_get: ^curl.slist
         if etag != "" {
             if_none_match := fmt.tprintf("If-None-Match: %s", etag)
@@ -336,14 +341,20 @@ handle_dir :: proc(args: []string) {
             fmt.printf("%sBłąd: Status %d%s\n", error_style, status, reset)
             os.exit(1)
         }
+        // Decompress gzip into a buffer
         buf: bytes.Buffer
-        defer bytes.buffer_destroy(&buf)
         decompress_err := gzip.load_from_bytes(body[:], &buf)
         if decompress_err != nil {
+            bytes.buffer_destroy(&buf)
             fmt.printf("%sBłąd: Nie można dekompresować archiwum%s\n", error_style, reset)
             os.exit(1)
         }
-        tar_data := bytes.buffer_to_bytes(&buf)
+        // Copy tar data out of buffer before destroying it
+        // bytes.buffer_to_bytes returns a slice INTO the buffer — we must copy it
+        raw_tar := bytes.buffer_to_bytes(&buf)
+        tar_data := make([]byte, len(raw_tar))
+        copy(tar_data, raw_tar)
+        bytes.buffer_destroy(&buf)
         defer delete(tar_data)
         fmt.printf("\n%sRozpakowywanie plików...%s\n", info_style, reset)
         extract_dir := "."
@@ -397,6 +408,9 @@ make_directory_recursive :: proc(path: string, mode: u32 = 0o777) {
     }
     _ = os.make_directory(path, transmute(os.Permissions) mode)
 }
+// FIX: removed defer delete(elems) inside loop — in Odin defer runs at end of
+// *function*, not block/iteration, causing multiple frees of the same memory.
+// Now elems is deleted explicitly at the end of each iteration.
 extract_tar :: proc(tar_data: []byte, extract_dir: string, extract_strip: int) -> int {
     count := 0
     pos := 0
@@ -417,37 +431,34 @@ extract_tar :: proc(tar_data: []byte, extract_dir: string, extract_strip: int) -
             pos += int(size) + pad
             continue
         }
-        elems: [dynamic]string
+        // Build target path — use temp_allocator, no dynamic array, no defer delete
+        elems := make([dynamic]string, 0, len(parts) + 1, context.temp_allocator)
         append(&elems, extract_dir)
         append(&elems, ..parts[extract_strip:])
         target, _ := filepath.join(elems[:], context.temp_allocator)
-        defer delete(elems)
         if typeflag == u8('5') { // Directory
             make_directory_recursive(target, u32(mode))
             count += 1
             pad := (512 - (int(size) % 512)) % 512
             pos += int(size) + pad
             continue
-        } else if typeflag == u8('0') || typeflag == u8(0) { // File
+        } else if typeflag == u8('0') || typeflag == u8(0) { // Regular file
             dir := filepath.dir(target)
             make_directory_recursive(dir)
             file, ferr := os.open(target, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, transmute(os.Permissions) u32(mode & 0o777))
             if ferr != nil {
-                // Handle error if needed
                 pad := (512 - (int(size) % 512)) % 512
                 pos += int(size) + pad
                 continue
             }
-            defer os.close(file)
             data_end := pos + int(size)
             if data_end > len(tar_data) {
+                os.close(file)
                 break
             }
             data := tar_data[pos:data_end]
-            _, werr := os.write(file, data)
-            if werr != nil {
-                // ignore for now
-            }
+            os.write(file, data)
+            os.close(file)
             pos = data_end
             pad := (512 - (int(size) % 512)) % 512
             pos += pad
@@ -566,7 +577,7 @@ download_with_sparse :: proc(user, repo, branch, folder: string) -> (err: string
     if old_dir != "" {
         _ = os.remove_all(old_dir)
     }
-    _ = os.remove_all(temp_dir) // Clean up
+    _ = os.remove_all(temp_dir)
     return ""
 }
 count_files_and_folders :: proc(dir: string) -> int {
@@ -582,7 +593,7 @@ count_files_and_folders :: proc(dir: string) -> int {
         }
         delete(entries)
     }
-    count := 1 // self
+    count := 1
     for e in entries {
         if e.type == .Directory {
             full, _ := filepath.join([]string{dir, e.name}, context.temp_allocator)
