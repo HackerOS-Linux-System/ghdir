@@ -78,7 +78,9 @@ update_progress_bar :: proc(bar: ^Progress_Bar, current: i64 = -1) {
     width := 50
     filled := int(math.round(percent / 100 * f64(width)))
     context = runtime.default_context()
-    bar_str := strings.concatenate({strings.repeat("=", filled), strings.repeat("-", width - filled)})
+    repeat_eq := strings.repeat("=", filled, context.temp_allocator)
+    repeat_dash := strings.repeat("-", width - filled, context.temp_allocator)
+    bar_str := strings.concatenate({repeat_eq, repeat_dash}, context.temp_allocator)
     fmt.printf("\r%s [%s] %.2f%%", bar.description, bar_str, percent)
     if bar.current >= bar.total {
         fmt.println()
@@ -104,8 +106,8 @@ header_callback :: proc "c" (ptr: rawptr, size: uintptr, nmemb: uintptr, userdat
     line := strings.trim_space(string(line_bytes))
     if len(line) == 0 { return size * nmemb }
     if strings.contains(line, ":") {
-        parts := strings.split_n(line, ":", 2)
-        key := strings.trim_space(strings.to_lower(parts[0]))
+        parts := strings.split_n(line, ":", 2, context.temp_allocator)
+        key := strings.trim_space(strings.to_lower(parts[0], context.temp_allocator))
         value := strings.trim_space(parts[1])
         hd[key] = value
     }
@@ -117,7 +119,8 @@ handle_file :: proc(args: []string) {
         os.exit(1)
     }
     url := args[0]
-    filename := filepath.base(url) if !strings.contains(url, "?") else strings.split(url, "?")[0]
+    base_url := url if !strings.contains(url, "?") else strings.split(url, "?", context.temp_allocator)[0]
+    filename := filepath.base(base_url)
     fmt.printf("%sgetit file • Pobieranie pliku%s\n", title_style, reset)
     fmt.printf(" URL: %s\n", url)
     fmt.printf(" Zapisywanie jako: %s\n\n", filename)
@@ -209,15 +212,12 @@ handle_repo :: proc(args: []string) {
     }
 }
 run_command :: proc(cmd: string, args: ..string) -> (err: string) {
-    full_cmd := make([]string, 1 + len(args))
-    defer delete(full_cmd)
+    full_cmd := make([]string, 1 + len(args), context.temp_allocator)
     full_cmd[0] = cmd
     copy(full_cmd[1:], args)
     context = runtime.default_context()
-    full_cmd_str := strings.join(full_cmd, " ")
-    defer delete(full_cmd_str)
-    cstr := strings.clone_to_cstring(full_cmd_str)
-    defer delete(cstr)
+    full_cmd_str := strings.join(full_cmd, " ", context.temp_allocator)
+    cstr := strings.clone_to_cstring(full_cmd_str, context.temp_allocator)
     ret := libc.system(cstr)
     if ret != 0 {
         return fmt.tprintf("Komenda '%s' zakończona błędem %d", cmd, ret)
@@ -283,7 +283,7 @@ handle_dir :: proc(args: []string) {
         input: [1024]byte
         n, _ := os.read(os.stdin, input[:])
         inp_str := strings.trim_space(string(input[:n]))
-        if strings.to_lower(inp_str) != "y" {
+        if strings.to_lower(inp_str, context.temp_allocator) != "y" {
             fmt.println("Przerwano.")
             return
         }
@@ -351,7 +351,7 @@ handle_dir :: proc(args: []string) {
         temp_dir: string
         if atomic {
             temp_dir = fmt.tprintf("getit_temp_%d", time.now()._nsec / 1_000_000_000)
-            os.make_directory(temp_dir)
+            _ = os.make_directory(temp_dir, transmute(os.Permissions) u32(0o777))
         } else {
             temp_dir = extract_dir
         }
@@ -363,19 +363,22 @@ handle_dir :: proc(args: []string) {
             old_dir: string
             if os.exists(target_dir) {
                 old_dir = fmt.tprintf("%s.old.%d", target_dir, time.now()._nsec / 1_000_000_000)
-                os.rename(target_dir, old_dir)
+                rename_err := os.rename(target_dir, old_dir)
+                if rename_err != nil {
+                    fmt.printf("%sBłąd podczas rename old%s\n", error_style, reset)
+                }
             }
             err := os.rename(temp_dir, target_dir)
-            if err != 0 {
+            if err != nil {
                 if old_dir != "" {
-                    os.rename(old_dir, target_dir)
+                    _ = os.rename(old_dir, target_dir)
                 }
-                os.remove_directory(temp_dir)
+                _ = os.remove_all(temp_dir)
                 fmt.printf("%sBłąd podczas atomic rename%s\n", error_style, reset)
                 os.exit(1)
             }
             if old_dir != "" {
-                os.remove_directory(old_dir)
+                _ = os.remove_all(old_dir)
             }
         }
     }
@@ -392,7 +395,7 @@ make_directory_recursive :: proc(path: string, mode: u32 = 0o777) {
     if parent != path && parent != "." && parent != "/" {
         make_directory_recursive(parent, mode)
     }
-    os.make_directory(path, mode)
+    _ = os.make_directory(path, transmute(os.Permissions) mode)
 }
 extract_tar :: proc(tar_data: []byte, extract_dir: string, extract_strip: int) -> int {
     count := 0
@@ -408,7 +411,7 @@ extract_tar :: proc(tar_data: []byte, extract_dir: string, extract_strip: int) -
         size, _ := strconv.parse_i64(size_str, 8)
         typeflag := header[156]
         context = runtime.default_context()
-        parts := strings.split(name, "/")
+        parts := strings.split(name, "/", context.temp_allocator)
         if len(parts) <= extract_strip {
             pad := (512 - (int(size) % 512)) % 512
             pos += int(size) + pad
@@ -417,7 +420,7 @@ extract_tar :: proc(tar_data: []byte, extract_dir: string, extract_strip: int) -
         elems: [dynamic]string
         append(&elems, extract_dir)
         append(&elems, ..parts[extract_strip:])
-        target := filepath.join(elems[:])
+        target, _ := filepath.join(elems[:], context.temp_allocator)
         defer delete(elems)
         if typeflag == u8('5') { // Directory
             make_directory_recursive(target, u32(mode))
@@ -428,8 +431,8 @@ extract_tar :: proc(tar_data: []byte, extract_dir: string, extract_strip: int) -
         } else if typeflag == u8('0') || typeflag == u8(0) { // File
             dir := filepath.dir(target)
             make_directory_recursive(dir)
-            file, ferr := os.open(target, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, int(mode))
-            if ferr != 0 {
+            file, ferr := os.open(target, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, transmute(os.Permissions) u32(mode & 0o777))
+            if ferr != nil {
                 // Handle error if needed
                 pad := (512 - (int(size) % 512)) % 512
                 pos += int(size) + pad
@@ -441,7 +444,10 @@ extract_tar :: proc(tar_data: []byte, extract_dir: string, extract_strip: int) -
                 break
             }
             data := tar_data[pos:data_end]
-            os.write(file, data)
+            _, werr := os.write(file, data)
+            if werr != nil {
+                // ignore for now
+            }
             pos = data_end
             pad := (512 - (int(size) % 512)) % 512
             pos += pad
@@ -463,7 +469,7 @@ parse_github_url :: proc(raw: string) -> (user, repo, branch, folder: string) {
     } else if strings.has_prefix(url, "github.com/") {
         url = url[len("github.com/"):]
     }
-    parts := strings.split(url, "/")
+    parts := strings.split(url, "/", context.temp_allocator)
     if len(parts) < 2 {
         fmt.printf("%sBłąd: Nieprawidłowy URL GitHub%s\n", error_style, reset)
         os.exit(1)
@@ -479,7 +485,7 @@ parse_github_url :: proc(raw: string) -> (user, repo, branch, folder: string) {
         i = 2
     }
     if i < len(parts) {
-        folder = strings.join(parts[i:], "/")
+        folder = strings.join(parts[i:], "/", context.temp_allocator)
     }
     return
 }
@@ -489,37 +495,43 @@ calculate_strip :: proc(repo, branch, folder: string) -> int {
 get_last_folder :: proc(folder: string) -> string {
     if folder == "" { return "." }
     context = runtime.default_context()
-    parts := strings.split(folder, "/")
+    parts := strings.split(folder, "/", context.temp_allocator)
     return parts[len(parts)-1]
 }
 load_cache :: proc() -> map[string]string {
     context = runtime.default_context()
-    home := os.get_env("HOME")
-    config_dir := filepath.join([]string{home, ".config"})
-    dir := filepath.join([]string{config_dir, "getit"})
-    os.make_directory(dir)
-    file := filepath.join([]string{dir, "cache.json"})
-    data, ok := os.read_entire_file(file)
-    if !ok { return make(map[string]string) }
+    home := os.get_env("HOME", context.allocator)
+    config_dir, _ := filepath.join([]string{home, ".config"}, context.temp_allocator)
+    dir, _ := filepath.join([]string{config_dir, "getit"}, context.temp_allocator)
+    _ = os.make_directory(dir, transmute(os.Permissions) u32(0o777))
+    file, _ := filepath.join([]string{dir, "cache.json"}, context.temp_allocator)
+    data, read_err := os.read_entire_file(file, context.allocator)
+    if read_err != nil {
+        return make(map[string]string)
+    }
+    defer delete(data, context.allocator)
     cache: map[string]string
-    err := json.unmarshal(data, &cache)
-    if err != nil { return make(map[string]string) }
+    unm_err := json.unmarshal(data, &cache, allocator = context.allocator)
+    if unm_err != nil { return make(map[string]string) }
     return cache
 }
 save_cache :: proc(cache: map[string]string) {
     context = runtime.default_context()
-    home := os.get_env("HOME")
-    config_dir := filepath.join([]string{home, ".config"})
-    dir := filepath.join([]string{config_dir, "getit"})
-    file := filepath.join([]string{dir, "cache.json"})
-    data, err := json.marshal(cache, {pretty = true, use_spaces = true, spaces = 2})
-    if err != nil { return }
-    os.write_entire_file(file, data)
+    home := os.get_env("HOME", context.allocator)
+    config_dir, _ := filepath.join([]string{home, ".config"}, context.temp_allocator)
+    dir, _ := filepath.join([]string{config_dir, "getit"}, context.temp_allocator)
+    file, _ := filepath.join([]string{dir, "cache.json"}, context.temp_allocator)
+    data, marsh_err := json.marshal(cache, {pretty = true, use_spaces = true, spaces = 2})
+    if marsh_err != nil { return }
+    defer delete(data, context.allocator)
+    write_err := os.write_entire_file(file, data)
+    if write_err != nil { return }
 }
 download_with_sparse :: proc(user, repo, branch, folder: string) -> (err: string) {
+    context = runtime.default_context()
     temp_dir := fmt.tprintf("getit_sparse_%d", time.now()._nsec / 1_000_000_000)
-    os.make_directory(temp_dir)
-    defer if err != "" { os.remove_directory(temp_dir) }
+    _ = os.make_directory(temp_dir, transmute(os.Permissions) u32(0o777))
+    defer if err != "" { _ = os.remove_all(temp_dir) }
     git_url := fmt.tprintf("https://github.com/%s/%s.git", user, repo)
     cmds := [][]string{
         {"git", "clone", "-b", branch, "--filter=blob:none", "--no-checkout", git_url, temp_dir},
@@ -531,47 +543,49 @@ download_with_sparse :: proc(user, repo, branch, folder: string) -> (err: string
         err = run_command(cmd[0], ..cmd[1:])
         if err != "" { return }
     }
-    os.remove_directory(filepath.join([]string{temp_dir, ".git"}))
+    git_dir, _ := filepath.join([]string{temp_dir, ".git"}, context.temp_allocator)
+    _ = os.remove_all(git_dir)
     sep_rune := filepath.SEPARATOR
     sep := fmt.tprintf("%c", sep_rune)
-    folder_path, _ := strings.replace_all(folder, "/", sep)
-    src_dir := filepath.join([]string{temp_dir, folder_path})
+    folder_path, replaced := strings.replace_all(folder, "/", sep, context.temp_allocator)
+    _ = replaced
+    src_dir, _ := filepath.join([]string{temp_dir, folder_path}, context.temp_allocator)
     target_dir := get_last_folder(folder)
     old_dir: string
     if os.exists(target_dir) {
         old_dir = fmt.tprintf("%s.old.%d", target_dir, time.now()._nsec / 1_000_000_000)
-        os.rename(target_dir, old_dir)
+        _ = os.rename(target_dir, old_dir)
     }
     rename_err := os.rename(src_dir, target_dir)
-    if rename_err != 0 {
+    if rename_err != nil {
         if old_dir != "" {
-            os.rename(old_dir, target_dir)
+            _ = os.rename(old_dir, target_dir)
         }
-        return fmt.tprintf("Błąd rename: %d", rename_err)
+        return fmt.tprintf("Błąd rename: %v", rename_err)
     }
     if old_dir != "" {
-        os.remove_directory(old_dir)
+        _ = os.remove_all(old_dir)
     }
-    os.remove_directory(temp_dir) // Clean up
+    _ = os.remove_all(temp_dir) // Clean up
     return ""
 }
 count_files_and_folders :: proc(dir: string) -> int {
     context = runtime.default_context()
     handle, open_err := os.open(dir, os.O_RDONLY)
-    if open_err != 0 { return 0 }
+    if open_err != nil { return 0 }
     defer os.close(handle)
-    entries, read_err := os.read_dir(handle, -1)
-    if read_err != 0 { return 0 }
+    entries, read_err := os.read_dir(handle, -1, context.allocator)
+    if read_err != nil { return 0 }
     defer {
         for e in entries {
-            delete(e.fullpath)
+            os.file_info_delete(e, context.allocator)
         }
         delete(entries)
     }
     count := 1 // self
     for e in entries {
-        if e.is_dir {
-            full := filepath.join([]string{dir, e.name})
+        if e.type == .Directory {
+            full, _ := filepath.join([]string{dir, e.name}, context.temp_allocator)
             count += count_files_and_folders(full)
         } else {
             count += 1
